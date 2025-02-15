@@ -1,32 +1,47 @@
 import streamlit as st
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-import pandas as pd
 import sqlite3
+import pandas as pd
 import datetime
+from contextlib import contextmanager
 
-# Initialize SQLite database
-conn = sqlite3.connect('transcripts.db')
-c = conn.cursor()
-c.execute('''
-    CREATE TABLE IF NOT EXISTS transcripts (
-        video_id TEXT PRIMARY KEY,
-        title TEXT,
-        timestamp TEXT,
-        text TEXT,
-        video_link TEXT
-    )
-''')
-conn.commit()
+# 🎯 Database setup
+DB_NAME = "transcripts.db"
 
-# Function to fetch video data from a playlist
+@contextmanager
+def get_db_connection():
+    """Context manager to handle SQLite database connections."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+# ✅ Function to create the database & table
+def create_database():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transcripts (
+                video_id TEXT,
+                title TEXT,
+                timestamp TEXT,
+                text TEXT,
+                video_link TEXT,
+                PRIMARY KEY (video_id, timestamp, text)
+            )
+        """)
+        conn.commit()
+
+# ✅ Function to fetch video metadata from a playlist
 def get_video_data(playlist_url):
     ydl_opts = {"quiet": True, "extract_flat": True, "force_generic_extractor": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
     return [{"video_id": entry["id"], "title": entry["title"]} for entry in info.get("entries", [])]
 
-# Function to fetch transcript for a video
+# ✅ Function to fetch transcripts for a video
 def get_transcript(video_id):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
@@ -39,62 +54,88 @@ def get_transcript(video_id):
             for entry in transcript
         ]
     except TranscriptsDisabled:
-        st.warning(f"Transcripts are disabled for video ID: {video_id}")
+        st.warning(f"❌ Transcripts are disabled for video ID: {video_id}")
         return None
     except Exception as e:
-        st.error(f"An error occurred: {e}")
+        st.error(f"⚠️ Error fetching transcript for video {video_id}: {e}")
         return None
 
-# Function to store transcripts in the database
+# ✅ Function to store transcripts in the database
 def store_transcripts(video_id, title, transcript):
-    for entry in transcript:
-        c.execute('''
-            INSERT OR IGNORE INTO transcripts (video_id, title, timestamp, text, video_link)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (video_id, title, entry["timestamp"], entry["text"], entry["video_link"]))
-    conn.commit()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        for entry in transcript:
+            cursor.execute("""
+                INSERT OR IGNORE INTO transcripts (video_id, title, timestamp, text, video_link) 
+                VALUES (?, ?, ?, ?, ?)
+            """, (video_id, title, entry["timestamp"], entry["text"], entry["video_link"]))
+        conn.commit()
 
-# Streamlit app interface
-st.title("YouTube Playlist Transcript Search")
+# ✅ Fetch transcripts for all videos in a playlist & store in DB
+def fetch_and_store_transcripts(playlist_url):
+    video_data = get_video_data(playlist_url)
+    for video in video_data:
+        transcript = get_transcript(video["video_id"])
+        if transcript:
+            store_transcripts(video["video_id"], video["title"], transcript)
 
-playlist_url = st.text_input("Enter YouTube Playlist URL:")
-search_term = st.text_input("Enter search term:")
+# ✅ Search for transcripts in the database
+def search_transcripts(keyword):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        query = "SELECT video_id, title, timestamp, text, video_link FROM transcripts WHERE text LIKE ?"
+        cursor.execute(query, (f"%{keyword}%",))
+        results = cursor.fetchall()
+    return results
 
-if st.button("Fetch and Search Transcripts"):
-    if not playlist_url or not search_term:
-        st.error("Please provide both a playlist URL and a search term.")
-    else:
-        with st.spinner("Fetching video data..."):
-            video_data = get_video_data(playlist_url)
-            if not video_data:
-                st.error("No videos found in the provided playlist.")
-            else:
-                st.success(f"Found {len(video_data)} videos in the playlist.")
-                for video in video_data:
-                    st.write(f"Processing video: {video['title']}")
-                    transcript = get_transcript(video["video_id"])
-                    if transcript:
-                        store_transcripts(video["video_id"], video["title"], transcript)
-                st.success("Transcripts fetched and stored successfully.")
+# ✅ Convert search results into a DataFrame
+def results_to_df(results):
+    return pd.DataFrame(results, columns=["video_id", "title", "timestamp", "text", "video_link"])
 
-        # Search the transcripts
-        c.execute('''
-            SELECT title, timestamp, text, video_link FROM transcripts
-            WHERE text LIKE ?
-        ''', (f"%{search_term}%",))
-        results = c.fetchall()
+# 🚀 **Streamlit Web App**
+def main():
+    st.title("🔎 YouTube Transcript Search")
 
-        if results:
-            st.write(f"Found {len(results)} matching results:")
-            for title, timestamp, text, video_link in results:
-                st.write(f"**{title}** ({timestamp})")
-                st.write(text)
-                st.write(f"[Watch Video]({video_link})")
+    # 🎥 Enter playlist URL
+    playlist_url = st.text_input("🎥 Enter YouTube Playlist URL:")
+
+    if st.button("Fetch Transcripts"):
+        if not playlist_url:
+            st.error("❌ Please enter a valid YouTube playlist URL.")
         else:
-            st.write("No matching transcripts found.")
+            with st.spinner("⏳ Fetching transcripts... This may take a few minutes."):
+                fetch_and_store_transcripts(playlist_url)
+            st.success("✅ Transcripts saved to database!")
 
-# Close the database connection when the app is stopped
-def close_connection():
-    conn.close()
+    # 🔍 Search transcripts
+    search_keyword = st.text_input("🔍 Enter a search term:")
 
-st.on_event("shutdown", close_connection)
+    if st.button("Search"):
+        if not search_keyword:
+            st.warning("⚠️ Please enter a search term.")
+        else:
+            results = search_transcripts(search_keyword)
+            if results:
+                df = results_to_df(results)
+                st.write(f"🔹 **Found {len(df)} matching results**")
+                st.write(df)
+
+                # 📥 Download CSV option
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Download Results as CSV", csv, "search_results.csv", "text/csv")
+
+                # 🎬 Show embedded videos with timestamps
+                for _, row in df.iterrows():
+                    st.markdown(f"### 🎬 [{row['title']}]({row['video_link']}) ({row['timestamp']})")
+                    st.write(row["text"])
+                    start_seconds = int(row["timestamp"].split(":")[-1])
+                    st.video(f"https://www.youtube.com/embed/{row['video_id']}?start={start_seconds}&autoplay=1")
+
+            else:
+                st.warning("❌ No matching transcripts found.")
+
+# ✅ Run the app
+if __name__ == "__main__":
+    create_database()  # Ensure the database exists
+    main()
+    
