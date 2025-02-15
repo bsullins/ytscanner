@@ -1,6 +1,5 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-import sqlite3
+streamlit
+pandas
+numpy
+yt-dlp
+youtube-transcript-api
